@@ -1,3 +1,62 @@
+<div align="center">
+  <a href="https://autooptm.com"><img src=".autooptm/logo.png" width="96" alt="AutoOptm"></a>
+
+  <h1>shallow-vs-deep-alignment · optimized by <a href="https://autooptm.com">AutoOptm</a></h1>
+
+  <p><b>2.61x faster end to end</b> on the command below, output verified against the stock program.</p>
+
+  <p>
+    <a href="https://autooptm.com"><img alt="speedup" src="https://img.shields.io/badge/end--to--end-2.61x-2ea44f"></a>
+    <a href="https://github.com/Unispac/shallow-vs-deep-alignment/commit/fb1749e3a9af3b90103574060b71c7daab1a4205"><img alt="base" src="https://img.shields.io/badge/upstream-fb1749e3a9af-blue"></a>
+    <img alt="card" src="https://img.shields.io/badge/measured%20on-RTX%204090-lightgrey">
+  </p>
+</div>
+
+> This is a fork of [Unispac/shallow-vs-deep-alignment](https://github.com/Unispac/shallow-vs-deep-alignment) at commit
+> [`fb1749e3a9af`](https://github.com/Unispac/shallow-vs-deep-alignment/commit/fb1749e3a9af3b90103574060b71c7daab1a4205) with the AutoOptm patch applied on top.
+> The optimisation was found, measured and verified automatically by [AutoOptm](https://autooptm.com);
+> the patch is also kept at [`.autooptm/autooptm.patch`](.autooptm/autooptm.patch).
+
+## The result
+
+| | |
+|---|---|
+| **Command** | `python finetune.py --model_name_or_path=ckpts/tinyllama-1.1b-chat --dataset_name=gsm8k --model_family=llama2 --learning_rate=2e-5 --per_device_train_batch_size=16 --gradient_accumulation_steps=1 --output_dir=logs/ao_gsm8k --logging_steps=1 --max_steps=100 --gradient_checkpointing --report_to=none --torch_dtype=bfloat16 --bf16=True --save_strategy=no --sft_type=sft --use_warmup=True` |
+| **Entry point** | `finetune.py` |
+| **Unit measured** | one optimizer step of supervised fine-tuning of TinyLlama-1.1B-Chat on GSM8K (batch 16, bf16, gradient checkpointing); the command's own 100 steps in one process |
+| **Before (stock)** | 534.2 ms per step (55.6 s for the timed training loop) |
+| **After (this tree, all switches default ON)** | 212.9 ms per step (21.3 s for the timed training loop; a one-time warm-up of ~46 s over the first 10 steps, 7 s for stock, is not included) |
+| **Speedup** | **2.61x** end to end on RTX 4090, noise floor of the host 0.5% |
+| **Output** | per-step training loss within 0.11% of the stock program's (the stock program's own repeat runs differ by 0.15%), 0.10% on held-out batches the optimiser never saw; first-step gradient cosine 0.9999 against it |
+
+### What changed
+
+| File | Where | Gain (alone) |
+|---|---|---|
+| `finetuning_buckets/trainer/trainer.py` | ConstrainedSFTTrainer.get_batch_loss_metrics() (new helpers) | 1.691x |
+| `finetune.py` | `__main__` -- after model load | 1.165x |
+| `finetuning_buckets/trainer/trainer.py` | ConstrainedSFTTrainer._inner_training_loop() (new helper) | 1.099x |
+| `finetune.py` | `__main__` -- TrainingArguments | 1.066x |
+| `finetuning_buckets/trainer/trainer.py` | the new helper behind get_batch_loss_metrics() | 1.017x |
+
+## Reproduce
+
+```bash
+git clone https://github.com/autooptm/shallow-vs-deep-alignment-ao.git
+cd shallow-vs-deep-alignment-ao
+# set up exactly as upstream documents (TinyLlama/TinyLlama-1.1B-Chat-v1.0 downloaded to ckpts/tinyllama-1.1b-chat), then:
+python finetune.py --model_name_or_path=ckpts/tinyllama-1.1b-chat --dataset_name=gsm8k --model_family=llama2 --learning_rate=2e-5 --per_device_train_batch_size=16 --gradient_accumulation_steps=1 --output_dir=logs/ao_gsm8k --logging_steps=1 --max_steps=100 --gradient_checkpointing --report_to=none --torch_dtype=bfloat16 --bf16=True --save_strategy=no --sft_type=sft --use_warmup=True
+```
+
+The diff against upstream is one commit: `git log -1 -p` shows it, and
+`git diff fb1749e3a9af` is the same patch as `.autooptm/autooptm.patch`.
+
+---
+
+<div align="center"><sub>Optimized by <a href="https://autooptm.com">AutoOptm</a> — point it at a repository, get back a verified speedup and the patch.</sub></div>
+
+---
+
 <h1 align='center' style="text-align:center; font-weight:bold; font-size:2.0em;letter-spacing:2.0px;"> Safety Alignment Should Be Made<br>More Than Just a Few Tokens Deep </h1>
 <p align='center' style="text-align:center;font-size:1.25em;">
     <a href="https://unispac.github.io/" target="_blank" style="text-decoration: none;">Xiangyu Qi<sup>1</sup></a>&nbsp;,&nbsp;

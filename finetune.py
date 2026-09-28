@@ -3,6 +3,7 @@ from transformers import HfArgumentParser, TrainingArguments
 from transformers.training_args import OptimizerNames
 from trl import ModelConfig, get_kbit_device_map, get_peft_config, get_quantization_config
 from dataclasses import dataclass, field
+import os
 import torch
 
 from finetuning_buckets.datasets.utils import get_finetuning_data
@@ -83,6 +84,9 @@ if __name__ == "__main__":
 
     model, tokenizer = get_model.get_model(model_config.model_name_or_path, model_kwargs, model_family=args.model_family)
     disable_dropout(model)
+    if os.environ.get("AUTOOPTM_OPT_1", "1") != "0" and model.config.model_type == "llama":
+        layer_cls = type(model.model.layers[0])
+        layer_cls.forward = torch.compile(layer_cls.forward)
     
     if args.sft_type == "soft_sft":
         ref_model = model
@@ -119,6 +123,9 @@ if __name__ == "__main__":
     
     if args.use_warmup:
         training_args.warmup_steps = 10
+
+    if os.environ.get("AUTOOPTM_OPT_2", "1") != "0" and training_args.optim == OptimizerNames.ADAMW_TORCH:
+        training_args.optim = OptimizerNames.ADAMW_TORCH_FUSED
     
     
     

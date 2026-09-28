@@ -1,0 +1,144 @@
+diff --git a/finetune.py b/finetune.py
+index 1dd0ea0..502ceac 100644
+--- a/finetune.py
++++ b/finetune.py
+@@ -3,6 +3,7 @@ from transformers import HfArgumentParser, TrainingArguments
+ from transformers.training_args import OptimizerNames
+ from trl import ModelConfig, get_kbit_device_map, get_peft_config, get_quantization_config
+ from dataclasses import dataclass, field
++import os
+ import torch
+ 
+ from finetuning_buckets.datasets.utils import get_finetuning_data
+@@ -83,6 +84,9 @@ if __name__ == "__main__":
+ 
+     model, tokenizer = get_model.get_model(model_config.model_name_or_path, model_kwargs, model_family=args.model_family)
+     disable_dropout(model)
++    if os.environ.get("AUTOOPTM_OPT_1", "1") != "0" and model.config.model_type == "llama":
++        layer_cls = type(model.model.layers[0])
++        layer_cls.forward = torch.compile(layer_cls.forward)
+     
+     if args.sft_type == "soft_sft":
+         ref_model = model
+@@ -119,6 +123,9 @@ if __name__ == "__main__":
+     
+     if args.use_warmup:
+         training_args.warmup_steps = 10
++
++    if os.environ.get("AUTOOPTM_OPT_2", "1") != "0" and training_args.optim == OptimizerNames.ADAMW_TORCH:
++        training_args.optim = OptimizerNames.ADAMW_TORCH_FUSED
+     
+     
+     
+diff --git a/finetuning_buckets/trainer/trainer.py b/finetuning_buckets/trainer/trainer.py
+index ffa9644..4fbbb50 100644
+--- a/finetuning_buckets/trainer/trainer.py
++++ b/finetuning_buckets/trainer/trainer.py
+@@ -239,6 +239,87 @@ SCALER_NAME = "scaler.pt"
+ FSDP_MODEL_NAME = "pytorch_model_fsdp"
+ 
+ 
++def _ao_opt_5(model, n_off):
++    """Leave the last `n_off` decoder layers out of gradient checkpointing."""
++    inner = getattr(model, "model", None)
++    layers = getattr(inner, "layers", None)
++    ckpt = getattr(inner, "_gradient_checkpointing_func", None)
++    if n_off <= 0 or layers is None or ckpt is None:
++        return
++    skip = {id(layer) for layer in layers[max(0, len(layers) - n_off):]}
++
++    def dial(fn, *args, **kwargs):
++        if id(getattr(fn, "__self__", None)) in skip:
++            return fn(*args)
++        return ckpt(fn, *args, **kwargs)
++    inner._gradient_checkpointing_func = dial
++
++
++_AO_OPT_9 = {}
++
++
++def _ao_opt_6(model):
++    if os.environ.get("AUTOOPTM_OPT_3", "1") == "0":
++        return False
++    config = getattr(model, "config", None)
++    if getattr(config, "model_type", None) != "llama" or getattr(config, "_attn_implementation", None) != "opt_11":
++        return False
++    if not (hasattr(model, "model") and hasattr(model, "lm_head")):
++        return False
++    try:
++        from torch.nn.attention.flex_attention import flex_attention  # noqa: F401
++    except ImportError:
++        return False
++    _ao_opt_7()
++    return True
++
++
++def _ao_opt_7():
++    if "flex" in _AO_OPT_9:
++        return
++    from torch.nn.attention.flex_attention import flex_attention
++    _AO_OPT_9["flex"] = torch.compile(flex_attention)
++    opt_11 = F.scaled_dot_product_attention
++
++    @torch.compiler.disable
++    def opt_10(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, **kwargs):
++        block_mask = _AO_OPT_9.get("block_mask")
++        if (block_mask is not None and attn_mask is None and dropout_p == 0.0 and not kwargs
++                and tuple(block_mask.seq_lengths) == (query.shape[-2], key.shape[-2])):
++            return _AO_OPT_9["flex"](query, key, value, block_mask=block_mask)
++        return opt_11(query, key, value, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=is_causal, **kwargs)
++    torch.nn.functional.scaled_dot_product_attention = opt_10
++
++
++def _ao_opt_8(model, batch, label_pad_token_id, accelerator):
++    """Mean -log p(label) over the supervised tokens, and the per-sample sum of log p,
++    computed on the concatenated real tokens of the batch (right padding dropped)."""
++    from torch.nn.attention.flex_attention import create_block_mask
++    input_ids, attention_mask, labels = batch["input_ids"], batch["attention_mask"], batch["labels"]
++    bsz = input_ids.shape[0]
++    real = attention_mask.bool()
++    # the padded path's target at every position: the next label, -100 past the end
++    targets = torch.cat([labels[:, 1:], labels.new_full((bsz, 1), label_pad_token_id)], 1)[real]
++    position_ids = (real.long().cumsum(1) - 1)[real][None]
++    doc = torch.repeat_interleave(torch.arange(bsz, device=input_ids.device), real.sum(1))
++    doc_padded = torch.cat([doc, doc.new_full((256,), -1)])
++    n_tok = doc.shape[0]
++
++    def causal_within_sample(b, h, q, kv):
++        return (doc_padded[q] == doc_padded[kv]) & (q >= kv)
++    _AO_OPT_9["block_mask"] = create_block_mask(causal_within_sample, None, None, n_tok, n_tok,
++                                                 device=input_ids.device, _compile=True)
++    supervised = targets != label_pad_token_id
++    with accelerator.autocast():
++        hidden = model.model(input_ids=input_ids[real][None], position_ids=position_ids,
++                             attention_mask=None, use_cache=False)[0][0]
++        logits = model.lm_head(hidden[supervised])
++    token_nll = F.cross_entropy(logits.float(), targets[supervised], reduction="none")
++    sample_logps = torch.zeros(bsz, device=input_ids.device, dtype=token_nll.dtype)
++    sample_logps.index_add_(0, doc[supervised], -token_nll.detach())
++    return token_nll.mean(), sample_logps
++
++
+ class ConstrainedSFTTrainer(Trainer):
+     r"""
+     This class is a wrapper around the `transformers.Trainer` class and inherits all of its attributes and methods.
+@@ -950,6 +1031,11 @@ class ConstrainedSFTTrainer(Trainer):
+         if self.safety_augmentation:
+             batch = self.gen_safety_augmentation_batch(batch)
+ 
++        if not self.use_soft_sft and not self.use_anchor and _ao_opt_6(model):
++            loss, policy_logps = _ao_opt_8(model, batch, self.label_pad_token_id, self.accelerator)
++            metrics[f"{prefix}logps/policy"] = policy_logps.detach().mean().cpu()
++            return loss, metrics
++
+         policy_logps, policy_logps_avg, policy_logits, policy_logps_full = self.model_forward(model, batch)
+         metrics[f"{prefix}logps/policy"] = policy_logps.detach().mean().cpu()
+ 
+@@ -1487,6 +1573,7 @@ class ConstrainedSFTTrainer(Trainer):
+                 gradient_checkpointing_kwargs = args.gradient_checkpointing_kwargs
+ 
+             self.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs=gradient_checkpointing_kwargs)
++            _ao_opt_5(self.model, int(os.environ.get("AUTOOPTM_OPT_4", "22")))
+ 
+         model = self._wrap_model(self.model_wrapped)
+ 
